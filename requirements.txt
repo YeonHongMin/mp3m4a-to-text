@@ -1,0 +1,24 @@
+# MP3 to Text Converter - Dependencies
+# Core STT Engine
+faster-whisper>=1.0.0
+
+# GUI Framework (Web-style)
+gradio>=4.0.0
+
+# Web UI for progress monitoring
+flask>=3.0.0
+
+# Progress bar for CLI
+tqdm>=4.66.0
+
+# Audio preprocessing (16kHz mono conversion)
+pydub>=0.25.0
+
+# Alternative: Native GUI (built-in Python)
+# tkinter is built-in, no need to install
+
+# Audio processing (required by faster-whisper)
+# ffmpeg needs to be installed on the system:
+# - Windows: choco install ffmpeg
+# - Mac: brew install ffmpeg
+# - Linux: sudo apt install ffmpeg
