@@ -1,4 +1,4 @@
-# 🎤 MP3 to Text Converter
+# 🎤 MP3/M4A/WAV to Text Converter
 
 **완전 무료 · 로컬 실행 · 한국어 최적화**
 
@@ -231,3 +231,4 @@ MIT License
 ---
 
 *Powered by [faster-whisper](https://github.com/guillaumekln/faster-whisper) & [OpenAI Whisper](https://github.com/openai/whisper)*
+
