@@ -12,13 +12,33 @@ flask>=3.0.0
 tqdm>=4.66.0
 
 # Audio preprocessing (16kHz mono conversion)
+# Requires ffmpeg to be installed on the system for optimal performance
 pydub>=0.25.0
 
 # Alternative: Native GUI (built-in Python)
 # tkinter is built-in, no need to install
 
-# Audio processing (required by faster-whisper)
-# ffmpeg needs to be installed on the system:
-# - Windows: choco install ffmpeg
-# - Mac: brew install ffmpeg
-# - Linux: sudo apt install ffmpeg
+# ============================================
+# SYSTEM DEPENDENCY (REQUIRED for performance)
+# ============================================
+# ffmpeg must be installed on your system:
+#
+# Windows (recommended):
+#   winget install "Gyan.FFmpeg"
+#
+# Windows (Chocolatey):
+#   choco install ffmpeg
+#
+# Mac:
+#   brew install ffmpeg
+#
+# Linux (Ubuntu/Debian):
+#   sudo apt install ffmpeg
+#
+# Verify installation:
+#   ffmpeg -version
+#
+# Without ffmpeg:
+#   - Audio preprocessing will fail
+#   - Conversion will be MUCH SLOWER
+#   - Transcription still works but uses original audio format

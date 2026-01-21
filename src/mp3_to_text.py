@@ -16,6 +16,12 @@ import argparse
 import warnings
 from pathlib import Path
 
+# Windows UTF-8 출력 설정 (cp949 인코딩 문제 해결)
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # Suppress warnings for cleaner output
 warnings.filterwarnings("ignore")
 
@@ -56,9 +62,10 @@ def preprocess_audio(audio_path: str, target_sample_rate: int = 16000) -> str:
         return audio_path
     
     try:
+        # 오디오 로드 (한글 경로 안전 처리)
+        audio_path_resolved = str(Path(audio_path).resolve())
         print(f"🔄 오디오 전처리 중... (16kHz 모노 변환)")
-        # 오디오 로드
-        audio = AudioSegment.from_file(audio_path)
+        audio = AudioSegment.from_file(audio_path_resolved)
         
         # 모노 변환
         if audio.channels > 1:
@@ -88,7 +95,9 @@ def get_audio_duration(audio_path: str) -> float:
         return 0.0
     
     try:
-        audio = AudioSegment.from_file(audio_path)
+        # 한글 경로 안전 처리
+        audio_path_resolved = str(Path(audio_path).resolve())
+        audio = AudioSegment.from_file(audio_path_resolved)
         return len(audio) / 1000.0  # 밀리초 → 초
     except Exception as e:
         print(f"⚠️ 오디오 길이 확인 실패: {e}")
@@ -126,7 +135,8 @@ class MP3ToTextConverter:
     }
     
     def __init__(self, model_size: str = "large-v3", device: str = "auto", 
-                 language: str = "ko", use_vad: bool = True, use_context: bool = False):
+                 language: str = "ko", use_vad: bool = False, use_context: bool = False,
+                 bgm_mode: bool = True, auto_clean_hallucination: bool = True):
         """
         변환기 초기화.
         
@@ -134,29 +144,39 @@ class MP3ToTextConverter:
             model_size: 모델 크기 (small, medium, large, large-v3)
             device: 'cuda', 'cpu', 또는 'auto' (자동 감지)
             language: 변환 언어 코드 (ko, en, ja 등)
-            use_vad: VAD 필터 사용 여부 (기본: True, 음성 누락 시 False)
+            use_vad: VAD 필터 사용 여부 (기본: False, 전체 오디오 처리)
             use_context: 이전 문맥 기반 추론 여부 (기본: False, 속도 우선)
+            auto_clean_hallucination: 변환 후 자동으로 할루시네이션 제거 (기본: True)
+            bgm_mode: 배경음악 모드 (기본: True, 배경음악 위 목소리 추출 최적화)
         """
         self.model_size = model_size
         self.language = language
         self.use_vad = use_vad
         self.use_context = use_context
+        self.bgm_mode = bgm_mode
+        self.auto_clean_hallucination = auto_clean_hallucination
         
-        # 자동 장치 감지
+        # 자동 장치 감지 (ctranslate2 기반)
         if device == "auto":
             try:
-                import torch
-                self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            except ImportError:
+                import ctranslate2
+                # ctranslate2로 CUDA 지원 여부 확인
+                cuda_types = ctranslate2.get_supported_compute_types("cuda")
+                if cuda_types:
+                    self.device = "cuda"
+                else:
+                    self.device = "cpu"
+            except Exception:
                 self.device = "cpu"
         else:
             self.device = device
         
         # 장치에 따른 최적 계산 타입
-        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        self.compute_type = "float16" if self.device == "cuda" else "float32"
         
         vad_status = "활성화" if use_vad else "비활성화"
-        print(f"🔧 설정: 모델={model_size}, 장치={self.device}, 언어={language}, VAD={vad_status}")
+        bgm_status = "활성화" if bgm_mode else "비활성화"
+        print(f"🔧 설정: 모델={model_size}, 장치={self.device}, 언어={language}, VAD={vad_status}, BGM모드={bgm_status}")
         print(f"📥 모델 로딩 중... (첫 실행 시 다운로드가 필요합니다)")
         
         self.model = WhisperModel(
@@ -170,9 +190,11 @@ class MP3ToTextConverter:
     # 환각(Hallucination)으로 자주 등장하는 패턴들
     HALLUCINATION_PATTERNS = [
         "한글자막", "자막 제작", "자막 by", "수고하셨습니다", 
-        "시청해주셔서 감사합니다", "MBC", "구독과 좋아요", 
+        "시청해주셔서 감사합니다", "구독과 좋아요", 
         "영상 편집", "제작 지원", "번역 :", "싱크 :", "배급 :",
-        "한글 자막", "by 한효정", "한글자막 by 한효정"
+        "한글 자막", "by 한효정", "한글자막 by 한효정", "아멘",
+        "이 시각 세계였습니다", "끝 끝", "다음 영상에서 만나요",
+        "다음 주에 만나요", "다음 시간에 뵙겠습니다"
     ]
 
     def is_hallucination(self, text: str) -> bool:
@@ -197,8 +219,11 @@ class MP3ToTextConverter:
         Yields:
             (segment, info, total_duration, processed_path)
         """
-        if not os.path.exists(audio_path):
-            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {audio_path}")
+        # 한글 경로 안전 처리: Path 객체로 변환
+        audio_path_obj = Path(audio_path)
+        if not audio_path_obj.exists():
+            raise FileNotFoundError(f"파일을 찾을 수 없습니다: {audio_path_obj.name}")
+        audio_path = str(audio_path_obj)  # 정규화된 경로 사용
         
         # 오디오 길이 확인
         total_duration = get_audio_duration(audio_path)
@@ -212,11 +237,32 @@ class MP3ToTextConverter:
         process_audio_path = processed_path if processed_path != audio_path else audio_path
         
         # 설정 가져오기
-        use_vad = getattr(self, 'use_vad', True)
+        use_vad = getattr(self, 'use_vad', False)
         use_context = getattr(self, 'use_context', False)
+        bgm_mode = getattr(self, 'bgm_mode', True)  # 기본값: True (배경음악 모드)
         
         # 한국어 인식 유도를 위한 프롬프트 (환각 방지용)
         initial_prompt = "[한글 음성 추출]" if self.language == 'ko' else None
+
+        # 배경음악 모드 설정
+        if bgm_mode:
+            # 배경음악 위 목소리 추출 최적화 설정
+            no_speech_threshold = 0.2  # 낮춰서 배경음악이 있어도 음성으로 인식
+            log_prob_threshold = -1.5  # 낮춰서 불확실한 음성도 수용
+            compression_ratio_threshold = None  # 압축률 체크 비활성화
+            hallucination_silence_threshold = 0.3  # 환각 억제
+            vad_threshold = 0.35  # VAD 임계값 낮춤 (더 민감하게)
+            vad_min_speech_duration_ms = 200  # 짧은 음성도 인식
+            vad_min_silence_duration_ms = 1000  # 짧은 침묵 허용
+        else:
+            # 기본 설정
+            no_speech_threshold = 0.6
+            log_prob_threshold = -1.0
+            compression_ratio_threshold = 2.4
+            hallucination_silence_threshold = None
+            vad_threshold = 0.05
+            vad_min_speech_duration_ms = 50
+            vad_min_silence_duration_ms = 50
 
         if use_vad:
             segments, info = self.model.transcribe(
@@ -227,10 +273,21 @@ class MP3ToTextConverter:
                 temperature=0,  # 반복 탐색 방지
                 initial_prompt=initial_prompt,
                 vad_filter=True,
-                vad_parameters=dict(threshold=0.05, min_speech_duration_ms=50, min_silence_duration_ms=50),
+                vad_parameters=dict(
+                    threshold=vad_threshold,
+                    min_speech_duration_ms=vad_min_speech_duration_ms,
+                    min_silence_duration_ms=vad_min_silence_duration_ms
+                ),
+                no_speech_threshold=no_speech_threshold,
+                log_prob_threshold=log_prob_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                hallucination_silence_threshold=hallucination_silence_threshold,
             )
         else:
-            print("⚠️ VAD 비활성화: 전체 오디오 처리")
+            if bgm_mode:
+                print("⚠️ VAD 비활성화: 전체 오디오 처리 (배경음악 모드 활성화)")
+            else:
+                print("⚠️ VAD 비활성화: 전체 오디오 처리")
             segments, info = self.model.transcribe(
                 process_audio_path,
                 language=self.language,
@@ -239,6 +296,10 @@ class MP3ToTextConverter:
                 temperature=0,
                 initial_prompt=initial_prompt,
                 vad_filter=False,
+                no_speech_threshold=no_speech_threshold,
+                log_prob_threshold=log_prob_threshold,
+                compression_ratio_threshold=compression_ratio_threshold,
+                hallucination_silence_threshold=hallucination_silence_threshold,
             )
         
         if show_progress:
@@ -357,6 +418,116 @@ class MP3ToTextConverter:
         
         return result
     
+    def _remove_hallucination(self, time_file: str) -> int:
+        """
+        time.md 파일에서 할루시네이션(반복 패턴)을 자동으로 제거합니다.
+        
+        Args:
+            time_file: *_time.md 파일 경로
+            
+        Returns:
+            int: 제거된 엔트리 수
+        """
+        import re
+        from collections import Counter
+        
+        # 파일 읽기
+        with open(time_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        
+        # 테이블 시작 위치 찾기
+        table_start = -1
+        for i, line in enumerate(lines):
+            if re.match(r'\|\s*\d{2}:\d{2}', line):
+                table_start = i
+                break
+        
+        if table_start == -1:
+            return 0  # 테이블 없음
+        
+        header_lines = lines[:table_start]
+        
+        # 엔트리 파싱
+        entries = []
+        for line in lines[table_start:]:
+            match = re.match(r'\|\s*(\d{2}:\d{2})\s*\|\s*(.+?)\s*\|', line)
+            if match:
+                entries.append({
+                    'time': match.group(1),
+                    'content': match.group(2).strip()
+                })
+        
+        if not entries:
+            return 0
+        
+        # 반복 패턴 감지 및 제거
+        cleaned = []
+        i = 0
+        removed_count = 0
+        
+        while i < len(entries):
+            current_content = entries[i]['content']
+            
+            # 연속 반복 체크 (3회 이상)
+            repeat_count = 1
+            j = i + 1
+            
+            while j < len(entries) and entries[j]['content'] == current_content:
+                repeat_count += 1
+                j += 1
+            
+            if repeat_count >= 3:
+                # 첫 번째만 유지
+                cleaned.append(entries[i])
+                removed_count += repeat_count - 1
+                i = j
+            else:
+                # 단어 반복 제거
+                words = current_content.split()
+                cleaned_words = []
+                k = 0
+                
+                while k < len(words):
+                    word = words[k]
+                    word_repeat = 1
+                    m = k + 1
+                    
+                    while m < len(words) and words[m] == word:
+                        word_repeat += 1
+                        m += 1
+                    
+                    if word_repeat >= 3:
+                        cleaned_words.append(word)
+                        k = m
+                    else:
+                        cleaned_words.append(word)
+                        k += 1
+                
+                cleaned_content = ' '.join(cleaned_words)
+                
+                # 너무 짧아진 경우 제외
+                if len(cleaned_content.strip()) >= 3:
+                    cleaned.append({
+                        'time': entries[i]['time'],
+                        'content': cleaned_content
+                    })
+                else:
+                    removed_count += 1
+                
+                i += 1
+        
+        # 변경사항이 있으면 파일 재작성
+        if removed_count > 0:
+            with open(time_file, 'w', encoding='utf-8') as f:
+                # 헤더 작성
+                f.writelines(header_lines)
+                
+                # 엔트리 작성
+                for entry in cleaned:
+                    f.write(f"| {entry['time']} | {entry['content']} |\n")
+        
+        return removed_count
+    
     def transcribe_to_file(self, audio_path: str, output_path: str, 
                            include_timestamps: bool = False) -> str:
         """
@@ -372,9 +543,12 @@ class MP3ToTextConverter:
         """
         result = self.transcribe(audio_path, show_timestamps=False)
         
-        with open(output_path, "w", encoding="utf-8") as f:
+        # 한글 파일명 인코딩 문제 방지
+        audio_filename = Path(audio_path).name
+        
+        with open(output_path, "w", encoding="utf-8", errors="replace") as f:
             f.write(f"# Audio Transcription\n")
-            f.write(f"# Source: {audio_path}\n")
+            f.write(f"# Source: {audio_filename}\n")
             f.write(f"# Language: {result['language']} ({result['language_probability']:.2%})\n")
             f.write(f"# ---\n\n")
             
@@ -388,32 +562,33 @@ class MP3ToTextConverter:
         print(f"📄 결과 저장됨: {output_path}")
         
         try:
+            info = None  # 초기화
             for segment, info_obj, total_duration, _ in self._transcribe_generator(audio_path, show_progress=True):
                 if info is None:
                     info = info_obj
                     # 언어 정보 등 파일에 업데이트 (선택 사항, 복잡해지므로 생략하거나 나중에 추가)
 
                 # 1. 전체 텍스트 파일에 추가 (Append)
-                with open(full_file, "a", encoding="utf-8") as f:
+                with open(full_file, "a", encoding="utf-8", errors="replace") as f:
                     text_chunk = segment.text.strip()
                     if text_chunk:
-                        # 문장 끝에 마침표가 있으면 줄바꿈
-                        if text_chunk.endswith('.'):
-                            f.write(f"{text_chunk}\n\n")
+                        # 문장 부호로 끝나면 줄바꿈, 아니면 공백
+                        if text_chunk[-1] in '.!?':
+                            f.write(f"{text_chunk}\n")
                         else:
                             f.write(f"{text_chunk} ")
 
                 # 2. 시간 구간 파일에 추가 (Append)
-                with open(time_file, "a", encoding="utf-8") as f:
+                with open(time_file, "a", encoding="utf-8", errors="replace") as f:
                     start_str = format_time(segment.start)
                     # end_str = format_time(segment.end) # 필요한 경우 사용
                     f.write(f"| {start_str} | {segment.text.strip()} |\n")
 
         except KeyboardInterrupt:
             print("\n🛑 사용자에 의해 중단되었습니다. 현재까지의 결과는 저장되었습니다.")
-            with open(full_file, "a", encoding="utf-8") as f:
+            with open(full_file, "a", encoding="utf-8", errors="replace") as f:
                 f.write("\n\n> **⚠️ 중단됨: 사용자에 의해 작업이 취소되었습니다.**\n")
-            with open(time_file, "a", encoding="utf-8") as f:
+            with open(time_file, "a", encoding="utf-8", errors="replace") as f:
                 f.write("\n> **⚠️ 중단됨: 사용자에 의해 작업이 취소되었습니다.**\n")
             return time_file, full_file, log_file
 
@@ -422,16 +597,16 @@ class MP3ToTextConverter:
         elapsed_str = format_time(end_time - start_time)
         
         # 로그에 결과 업데이트
-        with open(log_file, "a", encoding="utf-8") as f:
+        with open(log_file, "a", encoding="utf-8", errors="replace") as f:
             if info:
                 f.write(f"| **언어** | {info.language} ({info.language_probability:.1%}) |\n")
             f.write(f"| **소요 시간** | {elapsed_str} |\n\n")
 
         # 파일 상단 정보 업데이트 (선택적: 파일을 다시 읽어서 헤더 수정은 복잡하므로 꼬리말 추가)
-        with open(full_file, "a", encoding="utf-8") as f:
+        with open(full_file, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n\n---\n✅ **변환 완료** (소요 시간: {elapsed_str})")
             
-        with open(time_file, "a", encoding="utf-8") as f:
+        with open(time_file, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n\n---\n✅ **변환 완료** (소요 시간: {elapsed_str})")
 
         print(f"\n✅ 변환 완료! (총 {elapsed_str})")
@@ -453,36 +628,47 @@ class MP3ToTextConverter:
         start_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         date_str = datetime.now().strftime("%Y-%m-%d")
         
-        # 파일 경로 생성
-        time_file = f"{output_base}_time.md"
-        full_file = f"{output_base}_full.md"
+        # 파일 경로 생성 (한글 경로 안전 처리)
+        output_base_path = Path(output_base)
+        time_file = str(output_base_path.with_name(f"{output_base_path.stem}_time.md"))
+        full_file = str(output_base_path.with_name(f"{output_base_path.stem}_full.md"))
         
-        # 로그 파일 준비
-        log_dir = os.path.join(os.path.dirname(output_base) or ".", "log")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"{date_str}.md")
+        # 로그 파일 준비 (한글 경로 안전 처리)
+        log_dir = output_base_path.parent / "log"
+        log_dir.mkdir(exist_ok=True)
+        log_file = str(log_dir / f"{date_str}.md")
         
         # 로그 파일 헤더 (append)
         is_new_log = not os.path.exists(log_file) or os.path.getsize(log_file) == 0
-        with open(log_file, "a", encoding="utf-8") as f:
+        # 한글 파일명 인코딩 문제 방지를 위해 Path 사용
+        audio_path_obj = Path(audio_path)
+        audio_filename = audio_path_obj.name  # UTF-8로 안전하게 파일명 추출
+        
+        # 오디오 길이 측정
+        audio_duration = get_audio_duration(audio_path)
+        audio_duration_str = format_time(audio_duration) if audio_duration > 0 else "알 수 없음"
+        
+        # 한글 경로 인코딩 문제 방지를 위해 파일명만 사용
+        with open(log_file, "a", encoding="utf-8", errors="replace") as f:
             if is_new_log:
                 f.write(f"# 📋 Transcription Log - {date_str}\n\n")
             f.write(f"---\n\n")
-            f.write(f"## 🎵 {os.path.basename(audio_path)}\n\n")
+            f.write(f"## 🎵 {audio_filename}\n\n")
             f.write(f"| 항목 | 값 |\n|---|---|\n")
-            f.write(f"| **파일** | `{audio_path}` |\n")
+            f.write(f"| **파일** | `{audio_filename}` |\n")
+            f.write(f"| **오디오 길이** | {audio_duration_str} |\n")
             f.write(f"| **시작 시간** | {start_datetime} |\n")
             f.write(f"| **VAD** | {'활성화' if self.use_vad else '비활성화'} |\n")
         
         # 출력 파일 초기화
-        with open(full_file, "w", encoding="utf-8") as f:
+        with open(full_file, "w", encoding="utf-8", errors="replace") as f:
             f.write(f"# 📝 Audio Transcription - Full Text\n\n")
-            f.write(f"> **파일**: `{audio_path}`  \n")
+            f.write(f"> **파일**: `{audio_filename}`  \n")
             f.write(f"> **상태**: 변환 중... (실시간 업데이트)\n\n---\n\n")
             
-        with open(time_file, "w", encoding="utf-8") as f:
+        with open(time_file, "w", encoding="utf-8", errors="replace") as f:
             f.write(f"# ⏱️ Audio Transcription - Time Intervals\n\n")
-            f.write(f"> **파일**: `{audio_path}`  \n")
+            f.write(f"> **파일**: `{audio_filename}`  \n")
             f.write(f"> **상태**: 변환 중... (실시간 업데이트)\n\n---\n\n")
             f.write(f"| 시간 | 내용 |\n|---|---|\n")
 
@@ -498,7 +684,7 @@ class MP3ToTextConverter:
                 if info is None:
                     info = info_obj
                     # 언어 정보 로그에 업데이트
-                    with open(log_file, "a", encoding="utf-8") as f:
+                    with open(log_file, "a", encoding="utf-8", errors="replace") as f:
                          f.write(f"| **언어** | {info.language} ({info.language_probability:.1%}) |\n")
 
                 # 진행률 계산
@@ -526,31 +712,32 @@ class MP3ToTextConverter:
                     for milestone in range(10, 100, 10):
                         if progress_int >= milestone and milestone not in logged_progress:
                             logged_progress.add(milestone)
-                            with open(log_file, "a", encoding="utf-8") as f:
+                            with open(log_file, "a", encoding="utf-8", errors="replace") as f:
                                 f.write(f"| **진행률** | {milestone}% ({format_time(segment.end)}/{format_time(total_duration)}) |\n")
                 else:
                     # total_duration을 모를 때
                     print(f"\r세그먼트 {segment_count} | {format_time(segment.end)} | {segment.text.strip()[:30]:<30}", end="", flush=True)
 
                 # 1. 전체 텍스트 파일에 추가 (Append)
-                with open(full_file, "a", encoding="utf-8") as f:
+                with open(full_file, "a", encoding="utf-8", errors="replace") as f:
                     text_chunk = segment.text.strip()
                     if text_chunk:
-                        if text_chunk.endswith('.'):
-                            f.write(f"{text_chunk}\n\n")
+                        # 문장 부호로 끝나면 줄바꿈, 아니면 공백
+                        if text_chunk[-1] in '.!?':
+                            f.write(f"{text_chunk}\n")
                         else:
                             f.write(f"{text_chunk} ")
 
                 # 2. 시간 구간 파일에 추가 (Append)
-                with open(time_file, "a", encoding="utf-8") as f:
+                with open(time_file, "a", encoding="utf-8", errors="replace") as f:
                     start_str = format_time(segment.start)
                     f.write(f"| {start_str} | {segment.text.strip()} |\n")
 
         except KeyboardInterrupt:
             print("\n🛑 사용자에 의해 중단되었습니다. 현재까지의 결과는 저장되었습니다.")
-            with open(full_file, "a", encoding="utf-8") as f:
+            with open(full_file, "a", encoding="utf-8", errors="replace") as f:
                 f.write("\n\n> **⚠️ 중단됨: 사용자에 의해 작업이 취소되었습니다.**\n")
-            with open(time_file, "a", encoding="utf-8") as f:
+            with open(time_file, "a", encoding="utf-8", errors="replace") as f:
                 f.write("\n> **⚠️ 중단됨: 사용자에 의해 작업이 취소되었습니다.**\n")
             return time_file, full_file, log_file
 
@@ -559,19 +746,31 @@ class MP3ToTextConverter:
         elapsed_str = format_time(end_time - start_time)
         
         # 로그에 결과 업데이트
-        with open(log_file, "a", encoding="utf-8") as f:
+        with open(log_file, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"| **소요 시간** | {elapsed_str} |\n\n")
 
         # 파일 상단 정보 업데이트 (꼬리말 추가)
-        with open(full_file, "a", encoding="utf-8") as f:
+        with open(full_file, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n\n---\n✅ **변환 완료** (소요 시간: {elapsed_str})")
             
-        with open(time_file, "a", encoding="utf-8") as f:
+        with open(time_file, "a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n\n---\n✅ **변환 완료** (소요 시간: {elapsed_str})")
 
         print(f"\n✅ 변환 완료! (총 {elapsed_str})")
         print(f"📄 전체 내용: {full_file}")
         print(f"📄 시간 구간: {time_file}")
+        
+        # 할루시네이션 자동 제거 (옵션이 활성화된 경우)
+        if self.auto_clean_hallucination:
+            try:
+                print(f"\n🧹 할루시네이션 제거 중...")
+                cleaned_count = self._remove_hallucination(time_file)
+                if cleaned_count > 0:
+                    print(f"   ✂️  {cleaned_count}개 반복 패턴 제거 완료")
+                else:
+                    print(f"   ✨ 반복 패턴 없음 (정상)")
+            except Exception as e:
+                print(f"   ⚠️  할루시네이션 제거 실패 (무시됨): {e}")
         
         return time_file, full_file, log_file
 
@@ -584,17 +783,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 예시:
-  python mp3_to_text.py audio.mp3                    # 기본 변환
-  python mp3_to_text.py audio.mp3 -o result.txt      # 파일로 저장
-  python mp3_to_text.py audio.mp3 -o result --dual   # 두 가지 버전 저장 (_time.md, _full.md)
+  python mp3_to_text.py audio.mp3                    # 기본 변환 (audio_time.md, audio_full.md 생성)
+  python mp3_to_text.py audio.mp3 -o result.txt      # 단일 파일로 저장
   python mp3_to_text.py audio.mp3 -m large-v3        # 최고 정확도 모델
-  python mp3_to_text.py audio.mp3 -t                 # 타임스탬프 표시
+  python mp3_to_text.py audio.mp3 -t                 # 타임스탬프 표시 (--dual과 함께 사용)
   python mp3_to_text.py --dir ./mp3                  # 디렉터리 내 모든 파일 일괄 변환
         """
     )
     
     parser.add_argument("audio_file", nargs="?", help="변환할 MP3/WAV 파일 경로")
-    parser.add_argument("-o", "--output", help="출력 파일 경로 (생략 시 콘솔 출력)")
+    parser.add_argument("-o", "--output", help="출력 파일 경로 (단일 txt 파일로 저장)")
     parser.add_argument("-m", "--model", default="large-v3",
                         choices=["small", "medium", "large", "large-v3"],
                         help="모델 크기 (기본: large-v3)")
@@ -609,10 +807,14 @@ def main():
                         help="두 가지 버전 저장 (_time.md, _full.md)")
     parser.add_argument("--interval", type=int, default=30,
                         help="시간 구간 (초, 기본: 30)")
-    parser.add_argument("--no-vad", action="store_true",
-                        help="VAD 비활성화 (음성 누락 방지, 처리 시간 증가)")
+    parser.add_argument("--vad", action="store_true",
+                        help="VAD 활성화 (음성 구간만 처리, 속도 향상)")
     parser.add_argument("--context", action="store_true",
                         help="이전 문맥 참조 활성화 (정확도 향상, 속도 저하 가능)")
+    parser.add_argument("--no-bgm", action="store_true",
+                        help="배경음악 모드 비활성화 (기본값: 배경음악 모드 활성화)")
+    parser.add_argument("--no-clean", action="store_true",
+                        help="할루시네이션 자동 제거 비활성화 (기본값: 자동 제거 활성화)")
     parser.add_argument("--dir", metavar="DIRECTORY",
                         help="디렉터리 내 모든 MP3/WAV 파일 일괄 변환")
     
@@ -627,13 +829,19 @@ def main():
             print(f"❌ 디렉터리를 찾을 수 없습니다: {dir_path}")
             sys.exit(1)
         
-        # MP3/WAV/M4A 파일 검색
+        # MP3/WAV/M4A 파일 검색 (재귀적으로 하위 디렉터리까지 검색)
+        dir_path_obj = Path(dir_path)
         audio_files = []
-        for ext in ['*.mp3', '*.MP3', '*.wav', '*.WAV', '*.m4a', '*.M4A']:
-            audio_files.extend(glob.glob(os.path.join(dir_path, ext)))
+        
+        # 재귀적으로 모든 오디오 파일 찾기
+        for ext in ['*.mp3', '*.MP3', '*.wav', '*.WAV', '*.m4a', '*.M4A', '*.asf', '*.ASF']:
+            audio_files.extend(dir_path_obj.rglob(ext))
+        
+        # Path 객체를 문자열로 변환
+        audio_files = [str(f) for f in audio_files]
         
         if not audio_files:
-            print(f"⚠️ 디렉터리에 오디오 파일이 없습니다 (mp3/wav/m4a): {dir_path}")
+            print(f"⚠️ 디렉터리에 오디오 파일이 없습니다 (mp3/wav/m4a/asf): {dir_path}")
             sys.exit(1)
         
         audio_files.sort()
@@ -642,19 +850,24 @@ def main():
         print("=" * 50)
         
         for i, audio_file in enumerate(audio_files):
-            print(f"  {i+1}. {os.path.basename(audio_file)}")
+            # 한글 파일명 인코딩 문제 방지를 위해 Path 사용
+            print(f"  {i+1}. {Path(audio_file).name}")
         print("=" * 50 + "\n")
         
         # 변환기 초기화 (1회)
-        use_vad = not getattr(args, 'no_vad', False)
+        use_vad = getattr(args, 'vad', False)
         use_context = getattr(args, 'context', False)
+        auto_clean = not getattr(args, 'no_clean', False)
+        bgm_mode = not getattr(args, 'no_bgm', False)  # 기본값: True, --no-bgm 시 False
         
         converter = MP3ToTextConverter(
             model_size=args.model,
             device=args.device,
             language=args.language,
             use_vad=use_vad,
-            use_context=use_context
+            use_context=use_context,
+            bgm_mode=bgm_mode,
+            auto_clean_hallucination=auto_clean
         )
         
         # 각 파일 변환
@@ -662,7 +875,8 @@ def main():
         fail_count = 0
         
         for i, audio_file in enumerate(audio_files):
-            print(f"\n[{i+1}/{len(audio_files)}] 처리 중: {os.path.basename(audio_file)}")
+            # 한글 파일명 인코딩 문제 방지를 위해 Path 사용
+            print(f"\n[{i+1}/{len(audio_files)}] 처리 중: {Path(audio_file).name}")
             print("-" * 50)
             
             try:
@@ -728,15 +942,19 @@ def main():
                 print(f"❌ 오류: {e}")
     else:
         # CLI 모드 (단일 파일)
-        use_vad = not getattr(args, 'no_vad', False)
+        use_vad = getattr(args, 'vad', False)
         use_context = getattr(args, 'context', False)
+        auto_clean = not getattr(args, 'no_clean', False)
+        bgm_mode = not getattr(args, 'no_bgm', False)  # 기본값: True, --no-bgm 시 False
         
         converter = MP3ToTextConverter(
             model_size=args.model,
             device=args.device,
             language=args.language,
             use_vad=use_vad,
-            use_context=use_context
+            use_context=use_context,
+            bgm_mode=bgm_mode,
+            auto_clean_hallucination=auto_clean
         )
         
         if args.dual:
@@ -763,11 +981,105 @@ def main():
                 include_timestamps=args.timestamps
             )
         else:
-            result = converter.transcribe(args.audio_file, show_timestamps=args.timestamps)
-            print("\n📝 변환 결과:")
-            print("=" * 50)
-            print(result['text'])
-            print("=" * 50)
+            # 기본: 입력 파일명 기준으로 두 가지 버전 저장 (_time.md, _full.md)
+            # 한글 경로 안전 처리: 실제 파일 시스템에서 정확한 파일 찾기
+            audio_file_input = args.audio_file
+            
+            # 한글 파일명 인코딩 문제 해결
+            audio_file_path = None
+            
+            # 1단계: 직접 경로 확인 (Path 객체로 안전하게 처리)
+            try:
+                audio_file_path_obj = Path(audio_file_input).resolve()
+                if audio_file_path_obj.exists() and audio_file_path_obj.is_file():
+                    audio_file_path = audio_file_path_obj
+            except (OSError, ValueError):
+                pass
+            
+            # 2단계: 파일이 없으면 디렉터리에서 찾기
+            if audio_file_path is None or not audio_file_path.exists():
+                # 디렉터리 경로 파싱
+                try:
+                    input_path_obj = Path(audio_file_input)
+                    dir_path = input_path_obj.parent if input_path_obj.parent != Path('.') else Path('.')
+                    input_filename = input_path_obj.name
+                    ext = input_path_obj.suffix or '.mp3'
+                except:
+                    # 파싱 실패 시 기본값 사용
+                    dir_path = Path(os.path.dirname(audio_file_input) or ".")
+                    input_filename = os.path.basename(audio_file_input)
+                    ext = os.path.splitext(input_filename)[1] or '.mp3'
+                
+                # 디렉터리에서 실제 파일 찾기
+                if dir_path.exists() and dir_path.is_dir():
+                    candidates = []
+                    
+                    # 디렉터리 내 모든 파일 검사
+                    for f in os.listdir(str(dir_path)):
+                        file_path = dir_path / f
+                        
+                        # 파일이고 확장자가 일치하는 경우
+                        if file_path.is_file() and f.lower().endswith(ext.lower()):
+                            # 우선순위 점수 계산
+                            score = 0
+                            
+                            # 입력 파일명의 키워드 추출 (한글 깨짐 대응)
+                            # 원본 입력에서 한글 문자 추출 시도
+                            keywords = []
+                            try:
+                                # 입력 파일명이나 원본 인자에서 한글 문자 확인
+                                full_input = f"{input_filename} {audio_file_input}"
+                                # 한글 유니코드 범위: AC00-D7AF
+                                korean_chars = [c for c in full_input if '\uAC00' <= c <= '\uD7AF']
+                                if korean_chars:
+                                    # 연속된 한글 문자 조합을 키워드로 사용
+                                    korean_text = ''.join(korean_chars)
+                                    # 자주 사용되는 키워드 확인
+                                    if "정은임" in full_input or "정은임" in korean_text:
+                                        keywords.append("정은임")
+                                    if "마지막" in full_input or "마지막" in korean_text:
+                                        keywords.append("마지막")
+                                    if "방송" in full_input or "방송" in korean_text:
+                                        keywords.append("방송")
+                                    # 일반적인 한글 패턴 매칭 (최소 2자 이상)
+                                    if len(korean_text) >= 2:
+                                        # 파일명에서 해당 한글 문자들이 모두 포함되는지 확인
+                                        if all(k in f for k in korean_chars[:3]):  # 처음 3개 문자만 확인
+                                            score += 20
+                            except:
+                                pass
+                            
+                            # 파일명에 키워드가 포함되면 점수 증가
+                            for keyword in keywords:
+                                if keyword in f:
+                                    score += 30  # 키워드 매칭에 더 높은 점수
+                            
+                            # 확장자 일치 점수
+                            if f.lower().endswith(ext.lower()):
+                                score += 1
+                            
+                            candidates.append((score, file_path))
+                    
+                    # 점수가 높은 순으로 정렬
+                    if candidates:
+                        candidates.sort(key=lambda x: x[0], reverse=True)
+                        audio_file_path = candidates[0][1]
+                        if audio_file_path != candidates[0][1]:
+                            print(f"📁 파일 찾음: {audio_file_path.name}")
+            
+            # 3단계: 최종 확인
+            if audio_file_path is None or not audio_file_path.exists():
+                print(f"❌ 파일을 찾을 수 없습니다: {args.audio_file}")
+                print(f"💡 팁: --dir 옵션을 사용하면 한글 파일명 문제를 피할 수 있습니다.")
+                print(f"   예: python src/mp3_to_text.py --dir ./mp3")
+                sys.exit(1)
+            
+            output_base = str(audio_file_path.parent / audio_file_path.stem)
+            converter.transcribe_to_files(
+                str(audio_file_path),
+                output_base,
+                time_interval=args.interval
+            )
 
 
 if __name__ == "__main__":

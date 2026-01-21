@@ -9,18 +9,29 @@
 ```
 프로젝트: MP3 to Text Converter
 목적: 로컬 환경에서 오디오 파일을 텍스트로 변환
-기술 스택: Python, faster-whisper, Gradio
+기술 스택: Python, faster-whisper, Gradio, Flask, Tkinter, CUDA
 주요 파일:
-- src/mp3_to_text.py (핵심 변환 로직)
-- src/app_gui.py (Gradio GUI)
+- src/mp3_to_text.py (핵심 변환 로직 + CLI)
+- src/app_gui.py (Gradio GUI, port 7860)
+- src/web_ui.py (Flask Web UI, port 5001)
+- src/app_tkinter.py (Tkinter 네이티브 GUI)
+- src/fix_hallucination.py (할루시네이션 후처리)
+- convert_all.sh (일괄 변환 스크립트)
 ```
 
 ### 1.2 현재 기능
 - ✅ CLI 변환 (단일 파일, 디렉터리)
-- ✅ Gradio GUI
+- ✅ Gradio GUI (port 7860)
+- ✅ Flask Web UI (port 5001, 실시간 모니터링)
+- ✅ Tkinter 네이티브 GUI
 - ✅ 실시간 파일 저장
-- ✅ 환각(hallucination) 필터링
+- ✅ 환각(hallucination) 필터링 (실시간)
+- ✅ 환각 후처리 자동화 (_remove_hallucination)
 - ✅ VAD 옵션 (활성화/비활성화)
+- ✅ BGM 모드 (배경음악 위 음성 추출)
+- ✅ 문맥 참조 옵션 (--context)
+- ✅ CUDA GPU 가속
+- ✅ 깊은 depth 디렉터리 일괄 처리
 
 ---
 
@@ -98,7 +109,15 @@ GUI 수정 요청:
 
 대상: {컴포넌트명, 예: output_text}
 변경: {lines 조정, 스타일 변경 등}
-파일: src/app_gui.py
+파일: src/app_gui.py (Gradio) / src/web_ui.py (Flask) / src/app_tkinter.py (Tkinter)
+```
+
+### 3.4 일괄 변환 스크립트 수정
+```
+convert_all.sh 수정 요청:
+
+변경 사항: {설명}
+예상 영향: {어떤 동작이 바뀌는지}
 ```
 
 ---
@@ -147,12 +166,25 @@ class ClassName:
 # CLI 기본 테스트
 python src/mp3_to_text.py mp3/test.mp3
 
-# CLI 듀얼 출력 테스트
-python src/mp3_to_text.py mp3/test.mp3 --dual
+# CLI 디렉터리 테스트
+python src/mp3_to_text.py --dir mp3/test_folder/
 
-# GUI 테스트
+# Gradio GUI 테스트
 python src/app_gui.py
 # 브라우저에서 http://localhost:7860 접속
+
+# Flask Web UI 테스트
+python src/web_ui.py
+# 브라우저에서 http://localhost:5001 접속
+
+# Tkinter GUI 테스트
+python src/app_tkinter.py
+
+# 일괄 변환 테스트
+./convert_all.sh -y
+
+# 할루시네이션 후처리 테스트
+python src/fix_hallucination.py mp3/test_time.md -v
 ```
 
 ### 5.2 확인 항목
@@ -161,6 +193,9 @@ python src/app_gui.py
 - [ ] 환각 문구가 필터링되는가?
 - [ ] 진행률이 표시되는가?
 - [ ] 중단 시 데이터가 저장되는가?
+- [ ] 깊은 depth 디렉터리가 탐색되는가?
+- [ ] 할루시네이션 후처리가 자동 실행되는가?
+- [ ] BGM 모드가 정상 동작하는가?
 
 ---
 
@@ -205,32 +240,79 @@ python src/app_gui.py
 
 ### 8.1 환각 필터링 위치
 ```python
-# src/mp3_to_text.py, 라인 170~
+# src/mp3_to_text.py
 HALLUCINATION_PATTERNS = [
-    "한글자막", "자막 제작", ...
+    "한글자막", "자막 제작", "자막 by", "수고하셨습니다", 
+    "시청해주셔서 감사합니다", "구독과 좋아요", 
+    "영상 편집", "제작 지원", "번역 :", "싱크 :", "배급 :",
+    "한글 자막", "by 한효정", "한글자막 by 한효정", "아멘",
+    "이 시각 세계였습니다", "끝 끝", "다음 영상에서 만나요",
+    "다음 주에 만나요", "다음 시간에 뵙겠습니다"
 ]
 
 def is_hallucination(self, text: str) -> bool:
     ...
 ```
 
-### 8.2 VAD 설정 위치
+### 8.2 할루시네이션 후처리 위치
 ```python
-# src/mp3_to_text.py, _transcribe_generator 메서드
-vad_parameters=dict(
-    threshold=0.05,
-    min_speech_duration_ms=50,
-    min_silence_duration_ms=50
-)
+# src/mp3_to_text.py
+def _remove_hallucination(self, time_file: str) -> int:
+    """time.md 파일에서 반복 패턴 자동 제거"""
+    ...
 ```
 
-### 8.3 GUI 레이아웃 위치
+### 8.3 BGM 모드 설정 위치
 ```python
-# src/app_gui.py, 라인 190~
+# src/mp3_to_text.py, _transcribe_generator 메서드
+if bgm_mode:
+    no_speech_threshold = 0.2
+    log_prob_threshold = -1.5
+    hallucination_silence_threshold = 0.3
+    vad_threshold = 0.35
+    vad_min_speech_duration_ms = 200
+    vad_min_silence_duration_ms = 1000
+```
+
+### 8.4 일괄 변환 스크립트 위치
+```bash
+# convert_all.sh
+# 깊은 depth 디렉터리 탐색
+mapfile -t SUBDIRS < <(find "$MP3_DIR" -type f \
+    \( -name "*.mp3" -o -name "*.wav" -o -name "*.m4a" -o -name "*.asf" \) \
+    -printf '%h\n' 2>/dev/null | sort -u)
+```
+
+### 8.5 GUI 레이아웃 위치
+```python
+# src/app_gui.py - Gradio
 # CSS 및 Gradio 컴포넌트 정의
+
+# src/web_ui.py - Flask
+# HTML_TEMPLATE 변수에 전체 UI 정의
+
+# src/app_tkinter.py - Tkinter
+# setup_ui() 메서드에 UI 정의
+```
+
+### 8.6 CLI 옵션 전체 목록
+```python
+# src/mp3_to_text.py, main() 함수
+parser.add_argument("-o", "--output")           # 출력 파일
+parser.add_argument("-m", "--model")            # 모델 크기
+parser.add_argument("-l", "--language")         # 언어 코드
+parser.add_argument("--device")                 # 실행 장치
+parser.add_argument("-t", "--timestamps")       # 타임스탬프 표시
+parser.add_argument("--dual")                   # 듀얼 출력
+parser.add_argument("--interval")               # 시간 구간
+parser.add_argument("--vad")                    # VAD 활성화
+parser.add_argument("--context")                # 문맥 참조 활성화
+parser.add_argument("--no-bgm")                 # BGM 모드 비활성화
+parser.add_argument("--no-clean")               # 할루시네이션 자동 제거 비활성화
+parser.add_argument("--dir")                    # 디렉터리 일괄 변환
 ```
 
 ---
 
-*문서 버전: 1.0*
-*최종 수정: 2026-01-11*
+*문서 버전: 1.2*
+*최종 수정: 2026-01-21*

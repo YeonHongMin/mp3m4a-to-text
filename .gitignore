@@ -93,11 +93,30 @@ dmypy.json
 .vscode/
 .idea/
 
-# Project specific
-# MP3 file & output (keep source code only)
-mp3/*.mp3
-mp3/*.wav
-mp3/*.m4a
-# If you want to ignore generated logs and markdown files as well, uncomment below:
-# mp3/*.md
-# mp3/log/
+# AI Assistant directories (do not expose)
+.claude/
+.gemini/
+
+# Log files
+*.log
+
+# Cache
+__pycache__/
+*.pyc
+
+# Project specific: mp3 directory
+# Keep the directory structure but ignore audio file contents
+mp3/**/*.mp3
+mp3/**/*.MP3
+mp3/**/*.wav
+mp3/**/*.WAV
+mp3/**/*.m4a
+mp3/**/*.M4A
+mp3/**/*.asf
+mp3/**/*.ASF
+mp3/**/*.flac
+mp3/**/*.FLAC
+mp3/**/*.ogg
+mp3/**/*.OGG
+mp3/**/*.wma
+mp3/**/*.WMA
